@@ -12,9 +12,6 @@ from backtrader.metabase import MetaParams
 from backtrader.utils.py3 import queue, with_metaclass
 from backtrader import date2num, num2date
 
-import random
-import json
-
 
 class MTraderError(Exception):
     def __init__(self, *args, **kwargs):
@@ -71,6 +68,7 @@ class MTraderAPI:
         self.EVENTS_PORT = 15558  # PUSH/PULL port
         self.INDICATOR_DATA_PORT = 15559  # REP/REQ port
         self.CHART_DATA_PORT = 15560  # PUSH port
+        self.DATA_PUB_PORT = 15561  # PUB port for spreading multiple symbol data
         self.debug = kwargs["debug"]
 
         # ZeroMQ timeout in seconds
@@ -102,6 +100,11 @@ class MTraderAPI:
             # set port timeout
             # TODO check if port is listening and error handling
             self.chart_data_socket.connect("tcp://{}:{}".format(self.HOST, self.CHART_DATA_PORT))
+
+            self.data_pub_socket = context.socket(zmq.PUB)
+            self.data_pub_socket.RCVTIMEO = data_timeout * 1000
+            self.data_pub_socket.set_hwm(1000)
+            self.data_pub_socket.bind("tcp://{}:{}".format(self.HOST, self.DATA_PUB_PORT))
 
         except zmq.ZMQError:
             raise zmq.ZMQBindError("Binding ports ERROR")
@@ -298,6 +301,9 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
 
     params = (("host", "localhost"), ("debug", False), ("datatimeout", 10))
 
+    subscribe = None
+    datacounter = 0
+
     _DTEPOCH = datetime(1970, 1, 1)
 
     # MTrader supported granularities
@@ -305,6 +311,7 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
         (bt.TimeFrame.Ticks, 1): "TICK",
         (bt.TimeFrame.Minutes, 1): "M1",
         (bt.TimeFrame.Minutes, 5): "M5",
+        (bt.TimeFrame.Minutes, 10): "M10",
         (bt.TimeFrame.Minutes, 15): "M15",
         (bt.TimeFrame.Minutes, 30): "M30",
         (bt.TimeFrame.Minutes, 60): "H1",
@@ -408,6 +415,15 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
         self.notifs.append(None)  # put a mark / threads could still append
         return [x for x in iter(self.notifs.popleft, None)]
 
+    def get_accountinfo(self):
+        account_info = self.oapi.construct_and_send(action="ACCOUNT")
+        if self.debug:
+            print("Account info: {}".format(account_info))
+        # Error handling
+        if account_info["error"]:
+            raise ServerDataError(account_info)
+        return account_info
+
     def get_positions(self):
         positions = self.oapi.construct_and_send(action="POSITIONS")
         # Error handling
@@ -459,6 +475,7 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
     def _t_livedata(self):
         # create socket connection for the Thread
         socket = self.oapi.live_socket()
+        self._t_livedata_exists = True
         while True:
             try:
                 last_data = socket.recv_json()
@@ -467,7 +484,15 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
             except zmq.ZMQError:
                 raise zmq.NotDone("Live data ERROR")
 
-            self.q_livedata.put(last_data)
+            if self.subscribe == 'DATA':
+                self.q_livedata.put(last_data)
+            else:
+                if last_data['status'] == 'DISCONNECTED':
+                    continue
+
+                self.oapi.data_pub_socket.send_string(last_data['symbol'], flags=zmq.SNDMORE)
+                self.oapi.data_pub_socket.send_json(last_data)
+                self.datacounter += 1
 
     def _t_streaming_events(self):
         # create socket connection for the Thread
@@ -680,17 +705,12 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
         )
 
         if ret_val["error"]:
-            print(ret_val)
-            raise ServerConfigError(ret_val["description"])
-            self.put_notification(ret_val["description"])
+            raise ServerConfigError(ret_val["description"], symbol)
+            # self.put_notification(ret_val["description"])
 
     def check_account(self) -> None:
         """Get MetaTrader 5 account settings"""
-        conf = self.oapi.construct_and_send(action="ACCOUNT")
-
-        # Error handling
-        if conf["error"]:
-            raise ServerDataError(conf)
+        conf = self.get_accountinfo()
 
         for key, value in conf.items():
             print(key, value, sep=" - ")
@@ -832,13 +852,13 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
             # self.put_notification(ret_val["description"])
 
     def push_chart_data(
-        self,
-        chart_id,
-        mt_chart_id,
-        chart_indicator_id,
-        indicator_buffer_id,
-        from_date,
-        data,
+            self,
+            chart_id,
+            mt_chart_id,
+            chart_indicator_id,
+            indicator_buffer_id,
+            from_date,
+            data,
     ):
         """Pushes backtrader indicator values to be distributed to be drawn by JsonAPIIndicator instances"""
 
@@ -911,9 +931,9 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
         return ret_val
 
     def indicator_data(
-        self,
-        indicatorId,
-        fromDate,
+            self,
+            indicatorId,
+            fromDate,
     ):
         """Recieves values from a MT5 indicator instance"""
 
@@ -951,12 +971,12 @@ class MTraderStore(with_metaclass(MetaSingleton, object)):
             # self.put_notification(ret_val["description"])
 
     def write_csv(
-        self,
-        symbol: str,
-        timeframe: str,
-        compression: int = 1,
-        fromdate: datetime = None,
-        todate: datetime = None,
+            self,
+            symbol: str,
+            timeframe: str,
+            compression: int = 1,
+            fromdate: datetime = None,
+            todate: datetime = None,
     ) -> None:
         """Request MT5 to write history data to CSV a file"""
 
